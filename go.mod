@@ -1,4 +1,4 @@
-module skyliftuav.co.uk/valkey-go
+module github.com/Skyliftuav/valkey-go
 
 go 1.23.4
 
