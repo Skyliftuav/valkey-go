@@ -374,7 +374,7 @@ func (r *ValkeyAdapter) observerWorker(ctx context.Context, wg *sync.WaitGroup, 
 // --- MODIFIED ---
 // startSubscription is now a fast dispatcher that hands off messages to a pool of workers.
 func (r *ValkeyAdapter) startSubscription(ctx context.Context, subscription *Subscription) {
-	pubsub := r.client.Subscribe(ctx, subscription.Topic)
+	pubsub := r.client.PSubscribe(ctx, subscription.Topic)
 	defer pubsub.Close()
 
 	// Wait for subscription confirmation from Valkey.
