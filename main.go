@@ -202,7 +202,7 @@ func NewValkeyAdapter(publishQueue chan *PubMessage, logger *scribe.Logger) *Val
 		maxReconnectDelay: 30 * time.Second,
 		client:            createValkeyClient(config),
 		pubClient:         createValkeyClient(config),
-		subWorkerPoolSize: GetEnvAsInt("VALKEY_SUB_WORKER_POOL_SIZE", 10),
+		subWorkerPoolSize: GetEnvAsInt("VALKEY_SUB_WORKER_POOL_SIZE", 20),
 		subJobQueueSize:   GetEnvAsInt("VALKEY_SUB_JOB_QUEUE_SIZE", 256),
 	}
 }
@@ -421,6 +421,9 @@ func (r *ValkeyAdapter) startSubscription(ctx context.Context, subscription *Sub
 			select {
 			case jobs <- &ValkeyMessage{Topic: msg.Channel, Payload: msg.Payload}:
 				// Message successfully queued for a worker.
+			default:
+				// This block runs immediately if the `jobs` channel is full.
+				r.logger.Warn("Job queue for topic %s is full. Dropping message to prevent backpressure.", subscription.Topic)
 			}
 		}
 	}
