@@ -16,14 +16,69 @@ import (
 	lru "github.com/hashicorp/golang-lru/v2" // IMPORTANT: Add this dependency
 )
 
+// ValkeyMessage implements the message interface expected by observers
 type ValkeyMessage struct {
 	Topic   string
 	Payload string
 }
 
+// GetPayloadAsString returns the message payload as string
+func (m *ValkeyMessage) GetPayloadAsString() (string, bool) {
+	return m.Payload, true
+}
+
+// GetPayloadAsBytes returns the message payload as bytes
+func (m *ValkeyMessage) GetPayloadAsBytes() ([]byte, bool) {
+	return []byte(m.Payload), true
+}
+
+// GetDestinationName returns the topic/channel name
+func (m *ValkeyMessage) GetDestinationName() string {
+	return m.Topic
+}
+
 type PubMessage struct {
 	Topic   string
 	Payload []byte
+}
+
+func (m *PubMessage) GetPayloadAsBytes() ([]byte, bool) {
+	return []byte(m.Payload), true
+}
+
+func (m *PubMessage) GetPayloadAsString() (string, bool) {
+	return string(m.Payload), true
+}
+
+func (m *PubMessage) GetPayloadAsJSON() (map[string]any, bool) {
+	var data map[string]any
+	err := json.Unmarshal(m.Payload, &data)
+	if err != nil {
+		return nil, false
+	}
+	return data, true
+}
+
+func (m *PubMessage) GetDestinationName() string {
+	return m.Topic
+}
+
+type Observer struct {
+	Notify chan *ValkeyMessage
+}
+
+type SubMessage struct {
+	Topic    string
+	Observer Observer
+}
+
+// Subscriber is the interface for subscribing to topics.
+type Subscriber interface {
+	Connect()
+	Disconnect()
+	Subscribe(topic string, observer Observer) string
+	Unsubscribe(subID string)
+	Run(ctx context.Context)
 }
 
 type CloudEvent struct {
@@ -36,10 +91,31 @@ type CloudEvent struct {
 	Time        string `json:"time"`
 }
 
-type Observer struct {
-	Notify chan *ValkeyMessage
+func NewCloudEvent(source, t, subject, time string, data any) *CloudEvent {
+	return &CloudEvent{
+		ID:          uuid.New().String(),
+		Source:      source,
+		Type:        t,
+		SpecVersion: "1.0",
+		Data:        data,
+		Subject:     subject,
+		Time:        time,
+	}
 }
 
+func GetEnvAsBool(key string, def bool) bool {
+	if val, ok := os.LookupEnv(key); ok {
+		switch val {
+		case "true", "1", "TRUE", "True":
+			return true
+		case "false", "0", "FALSE", "False":
+			return false
+		}
+	}
+	return def
+}
+
+// Subscription struct with an ID and context for cancellation
 type Subscription struct {
 	ID       string
 	Topic    string
