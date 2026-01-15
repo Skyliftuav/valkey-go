@@ -82,13 +82,14 @@ type Subscriber interface {
 }
 
 type CloudEvent struct {
-	ID          string `json:"id"`
-	Source      string `json:"source"`
-	Type        string `json:"type"`
-	SpecVersion string `json:"specversion"`
-	Data        any    `json:"data"`
-	Subject     string `json:"subject"`
-	Time        string `json:"time"`
+	ID          string         `json:"id"`
+	Source      string         `json:"source"`
+	Type        string         `json:"type"`
+	SpecVersion string         `json:"specversion"`
+	Data        any            `json:"data"`
+	Subject     string         `json:"subject"`
+	Time        string         `json:"time"`
+	Extensions  map[string]any `json:"extensions,omitempty"`
 }
 
 func NewCloudEvent(source, t, subject, time string, data any) *CloudEvent {
@@ -100,7 +101,24 @@ func NewCloudEvent(source, t, subject, time string, data any) *CloudEvent {
 		Data:        data,
 		Subject:     subject,
 		Time:        time,
+		Extensions:  make(map[string]any),
 	}
+}
+
+func (ce *CloudEvent) ToJSON() ([]byte, error) {
+	return json.Marshal(ce)
+}
+
+func (ce *CloudEvent) ToString() (string, error) {
+	data, err := ce.ToJSON()
+	if err != nil {
+		return "", err
+	}
+	return string(data), nil
+}
+
+func (ce *CloudEvent) AddExtension(key string, value any) {
+	ce.Extensions[key] = value
 }
 
 func GetEnvAsBool(key string, def bool) bool {
