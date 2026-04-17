@@ -8,12 +8,12 @@ import (
 	"sync"
 	"time"
 
+	"encoding/json"
+
 	"github.com/google/uuid"
+	lru "github.com/hashicorp/golang-lru/v2"
 	"github.com/josh-tracey/scribe"
 	"github.com/redis/go-redis/v9"
-
-	"encoding/json"
-	lru "github.com/hashicorp/golang-lru/v2" // IMPORTANT: Add this dependency
 )
 
 // ValkeyMessage implements the message interface expected by observers
@@ -156,6 +156,9 @@ type ValkeyAdapter struct {
 	maxReconnectDelay time.Duration
 	subWorkerPoolSize int
 	subJobQueueSize   int
+
+	monitorOnce   sync.Once
+	monitorCancel context.CancelFunc
 }
 
 func NewValkeyAdapter(publishQueue chan *PubMessage, logger *scribe.Logger) *ValkeyAdapter {
@@ -192,21 +195,29 @@ func (r *ValkeyAdapter) Connect() error {
 	}
 
 	r.logger.Info("Connected to Valkey (Pub/Sub)")
-	go r.monitorConnection()
+
+	r.monitorOnce.Do(func() {
+		monitorCtx, monitorCancel := context.WithCancel(r.ctx)
+		r.monitorCancel = monitorCancel
+		go r.monitorConnection(monitorCtx)
+	})
+
 	return nil
 }
 
-func (r *ValkeyAdapter) monitorConnection() {
+func (r *ValkeyAdapter) monitorConnection(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-r.ctx.Done():
 			return
 		case <-ticker.C:
-			ctx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
-			err := r.client.Ping(ctx).Err()
+			pingCtx, cancel := context.WithTimeout(r.ctx, 5*time.Second)
+			err := r.client.Ping(pingCtx).Err()
 			cancel()
 
 			if err != nil {
@@ -218,6 +229,12 @@ func (r *ValkeyAdapter) monitorConnection() {
 }
 
 func (r *ValkeyAdapter) handleReconnection() {
+
+	if r.monitorCancel != nil {
+		r.monitorCancel()
+	}
+	r.monitorOnce = sync.Once{} // Reset so Connect() can start a fresh monitor
+
 	r.reconnectAttempts++
 	delay := time.Duration(r.reconnectAttempts) * time.Second
 	if delay > r.maxReconnectDelay {
@@ -395,6 +412,9 @@ func (r *ValkeyAdapter) resubscribeAll() {
 	r.subscriptionsMux.RUnlock()
 
 	for _, sub := range subs {
+
+		sub.Cancel()
+
 		newCtx, cancel := context.WithCancel(r.ctx)
 		sub.Cancel = cancel
 		go r.startSubscription(newCtx, sub)
@@ -403,11 +423,26 @@ func (r *ValkeyAdapter) resubscribeAll() {
 
 func (r *ValkeyAdapter) Disconnect() error {
 	r.cancel()
+
+	// Cancel monitor
+	if r.monitorCancel != nil {
+		r.monitorCancel()
+	}
+
 	r.subscriptionsMux.Lock()
 	r.subscriptions = make(map[string]*Subscription)
 	r.subscriptionsMux.Unlock()
-	return r.client.Close()
+
+	// Close BOTH clients
+	subErr := r.client.Close()
+	pubErr := r.pubClient.Close()
+	if subErr != nil {
+		return subErr
+	}
+	return pubErr
 }
+
+// ==================== ValkeyStreamsAdapter ====================
 
 type StreamSubscription struct {
 	ID         string
@@ -439,13 +474,15 @@ type ValkeyStreamsAdapter struct {
 	jobQueueSize        int
 	pendingMessageLimit int64
 	claimInterval       time.Duration
+
+	monitorOnce   sync.Once
+	monitorCancel context.CancelFunc
 }
 
 func NewValkeyStreamsAdapter(publishQueue chan *PubMessage, logger *scribe.Logger) *ValkeyStreamsAdapter {
 	config := loadConfig()
 
 	// Initialize LRU Cache for deduplication (Last 1000 IDs)
-	// This mirrors the Rust "processed_priority_ids" logic.
 	cache, err := lru.New[string, bool](1000)
 	if err != nil {
 		logger.Error("Failed to create LRU cache: %v", err)
@@ -482,16 +519,24 @@ func (a *ValkeyStreamsAdapter) Connect() error {
 	}
 
 	a.logger.Info("Connected to Valkey (Streams)")
-	go a.monitorConnection()
+
+	a.monitorOnce.Do(func() {
+		monitorCtx, monitorCancel := context.WithCancel(a.ctx)
+		a.monitorCancel = monitorCancel
+		go a.monitorConnection(monitorCtx)
+	})
+
 	return nil
 }
 
-func (a *ValkeyStreamsAdapter) monitorConnection() {
+func (a *ValkeyStreamsAdapter) monitorConnection(ctx context.Context) {
 	ticker := time.NewTicker(30 * time.Second)
 	defer ticker.Stop()
 
 	for {
 		select {
+		case <-ctx.Done():
+			return
 		case <-a.ctx.Done():
 			return
 		case <-ticker.C:
@@ -504,6 +549,12 @@ func (a *ValkeyStreamsAdapter) monitorConnection() {
 }
 
 func (a *ValkeyStreamsAdapter) handleReconnection() {
+
+	if a.monitorCancel != nil {
+		a.monitorCancel()
+	}
+	a.monitorOnce = sync.Once{}
+
 	a.reconnectAttempts++
 	delay := time.Duration(a.reconnectAttempts) * 2 * time.Second
 	if delay > a.maxReconnectDelay {
@@ -515,6 +566,8 @@ func (a *ValkeyStreamsAdapter) handleReconnection() {
 
 	if err := a.Connect(); err != nil {
 		a.logger.Error("Reconnection failed (streams): %v", err)
+
+		go a.handleReconnection()
 	} else {
 		a.logger.Info("Successfully reconnected (streams)")
 		a.reconnectAttempts = 0
@@ -601,7 +654,7 @@ func (a *ValkeyStreamsAdapter) listenToStream(ctx context.Context, sub *StreamSu
 	}
 }
 
-// streamWorker - IMPORTS RUST IDEMPOTENCY LOGIC
+// streamWorker with idempotency
 func (a *ValkeyStreamsAdapter) streamWorker(ctx context.Context, wg *sync.WaitGroup, sub *StreamSubscription, jobs <-chan redis.XMessage) {
 	defer wg.Done()
 	for {
@@ -620,7 +673,6 @@ func (a *ValkeyStreamsAdapter) streamWorker(ctx context.Context, wg *sync.WaitGr
 			}
 
 			// --- DEDUPLICATION CHECK ---
-			// Attempt to parse ID from CloudEvent JSON
 			var event CloudEvent
 			hasID := false
 			if err := json.Unmarshal([]byte(payload), &event); err == nil && event.ID != "" {
@@ -635,11 +687,9 @@ func (a *ValkeyStreamsAdapter) streamWorker(ctx context.Context, wg *sync.WaitGr
 			// Notify Observer
 			select {
 			case sub.Observer.Notify <- &ValkeyMessage{Topic: sub.Stream, Payload: payload}:
-				// Only mark processed IF successful and IF we had an ID
 				if hasID {
 					a.processedIDs.Add(event.ID, true)
 				}
-				// ACK the message to Redis so it doesn't re-send
 				a.client.XAck(ctx, sub.Stream, sub.Group, msg.ID)
 			case <-ctx.Done():
 				return
@@ -648,7 +698,7 @@ func (a *ValkeyStreamsAdapter) streamWorker(ctx context.Context, wg *sync.WaitGr
 	}
 }
 
-// PublishBatchToStream uses Pipelines for high throughput (Matches Rust perf)
+// PublishBatchToStream uses Pipelines for high throughput
 func (a *ValkeyStreamsAdapter) PublishBatchToStream(batch []*PubMessage) error {
 	if len(batch) == 0 {
 		return nil
@@ -660,7 +710,6 @@ func (a *ValkeyStreamsAdapter) PublishBatchToStream(batch []*PubMessage) error {
 	pipe := a.pubClient.Pipeline()
 
 	for _, msg := range batch {
-		// Wrap in standard "data" key for compatibility
 		values := map[string]any{"data": string(msg.Payload)}
 		pipe.XAdd(ctx, &redis.XAddArgs{
 			Stream: msg.Topic,
@@ -678,7 +727,6 @@ func (a *ValkeyStreamsAdapter) PublishBatchToStream(batch []*PubMessage) error {
 func (a *ValkeyStreamsAdapter) Run(ctx context.Context) {
 	batchSize := 50
 	batch := make([]*PubMessage, 0, batchSize)
-	// Tick slightly slower for streams to allow accumulation
 	ticker := time.NewTicker(100 * time.Millisecond)
 	defer ticker.Stop()
 
@@ -699,7 +747,6 @@ func (a *ValkeyStreamsAdapter) Run(ctx context.Context) {
 			}
 
 		case <-ticker.C:
-			// Also run health check on tick
 			a.HealthCheck()
 			if len(batch) > 0 {
 				a.PublishBatchToStream(batch)
@@ -744,15 +791,17 @@ func (a *ValkeyStreamsAdapter) claimPendingMessages(ctx context.Context, sub *St
 					}).Result()
 
 					if err == nil {
-						// Note: We don't push to jobs channel here to avoid potential blocking
-						// in this housekeeping routine. We could, but for now we let the
-						// main loop pick it up or just Ack if it was a ghost.
-						// Simplest for now: Just Log. If you need re-processing, push to observer.
 						for _, m := range msgs {
-							// Simple retry logic:
 							val, _ := m.Values["data"].(string)
-							sub.Observer.Notify <- &ValkeyMessage{Topic: sub.Stream, Payload: val}
-							a.client.XAck(ctx, sub.Stream, sub.Group, m.ID)
+
+							select {
+							case sub.Observer.Notify <- &ValkeyMessage{Topic: sub.Stream, Payload: val}:
+								a.client.XAck(ctx, sub.Stream, sub.Group, m.ID)
+							case <-ctx.Done():
+								return
+							case <-time.After(5 * time.Second):
+								a.logger.Warn("Timeout delivering claimed message %s, will retry next cycle", m.ID)
+							}
 						}
 					}
 				}
@@ -776,13 +825,24 @@ func (a *ValkeyStreamsAdapter) UnsubscribeFromStream(subscriptionID string) {
 
 func (a *ValkeyStreamsAdapter) Disconnect() error {
 	a.cancel()
+
+	if a.monitorCancel != nil {
+		a.monitorCancel()
+	}
+
 	a.subscriptionsMux.Lock()
 	for _, sub := range a.subscriptions {
 		sub.wg.Wait()
 	}
 	a.subscriptions = make(map[string]*StreamSubscription)
 	a.subscriptionsMux.Unlock()
-	return a.client.Close()
+
+	subErr := a.client.Close()
+	pubErr := a.pubClient.Close()
+	if subErr != nil {
+		return subErr
+	}
+	return pubErr
 }
 
 func (a *ValkeyStreamsAdapter) HealthCheck() error {
@@ -800,6 +860,10 @@ func (a *ValkeyStreamsAdapter) resubscribeAll() {
 	a.subscriptionsMux.RUnlock()
 
 	for _, sub := range subs {
+		// Cancel the old listener goroutine first
+		sub.Cancel()
+		sub.wg.Wait()
+
 		newCtx, cancel := context.WithCancel(a.ctx)
 		sub.Cancel = cancel
 		go a.listenToStream(newCtx, sub)
